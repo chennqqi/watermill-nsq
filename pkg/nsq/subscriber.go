@@ -3,6 +3,7 @@ package nsq
 import (
 	"context"
 	"sync"
+	"fmt"
 	"time"
 
 	"github.com/nsqio/go-nsq"
@@ -13,10 +14,12 @@ import (
 )
 
 type NsqSubscriberConfig struct {
-	//  nsq config
+	// nsq config
+	// nsq increse MaxAttempts to avoid TestResendOnError, see github.com/ThreeDotsLabs/watermill/pubsub/tests/test_pubsub.go L54
 	*nsq.Config
 	LookupdAddrs []string
 	NsqdAddrs    []string
+	GroupName string
 
 	// CloseTimeout determines how long subscriber will wait for Ack/Nack on close.
 	// When no Ack/Nack is received after CloseTimeout, subscriber will be closed.
@@ -28,7 +31,7 @@ type NsqSubscriberConfig struct {
 
 	// Requeue delay, default 1s
 	//
-	RequeuetTimeout time.Duration
+	RequeueTimeout time.Duration
 
 	// Unmarshaler is an unmarshaler used to unmarshaling messages from NATS format to Watermill format.
 	Unmarshaler Unmarshaler
@@ -41,8 +44,8 @@ func (c *NsqSubscriberConfig) setDefaults() {
 	if c.AckWaitTimeout <= 0 {
 		c.AckWaitTimeout = time.Second * 30
 	}
-	if c.RequeuetTimeout <= 0 {
-		c.RequeuetTimeout = time.Second
+	if c.RequeueTimeout <= 0 {
+		c.RequeueTimeout = time.Second
 	}
 
 	c.Unmarshaler = &GobMarshaler{}
@@ -53,7 +56,7 @@ func (c *NsqSubscriberConfig) Validate() error {
 		return errors.New("NsqSubscriberConfig.Unmarshaler is missing")
 	}
 
-	if len(c.NsqdAddrs) == 0 || len(c.LookupdAddrs) == 0 {
+	if len(c.NsqdAddrs) == 0 && len(c.LookupdAddrs) == 0 {
 		return errors.New(
 			"Either nsqdaddrs or lookupdaddrs should be set",
 		)
@@ -97,16 +100,20 @@ func (s *NsqSubscriber) Subscribe(ctx context.Context, topic string) (<-chan *me
 	}
 	s.subscribersWg.Add(1)
 
-	channel, _ := ctx.Value("channel").(string)
 	logFields := watermill.LogFields{
 		"provider": "nsq",
 		"topic":    topic,
-		"channel":  channel,
+	}
+	channel, ok := ctx.Value("channel").(string)
+	if !ok {
+		logFields["channel"] = channel
+		s.logger.Info("Subcriber not set channel, use configed group name", logFields)
+		channel = s.config.GroupName
 	}
 	requeueTo, ok := ctx.Value("requeue_timeout").(time.Duration)
 	if !ok {
 		s.logger.Info("Subcriber not set requeue_timeout, use config instand", logFields)
-		requeueTo = s.config.RequeuetTimeout
+		requeueTo = s.config.RequeueTimeout
 	}
 
 	s.logger.Info("Subscribing to Nsq topic", logFields)
@@ -119,9 +126,9 @@ func (s *NsqSubscriber) Subscribe(ctx context.Context, topic string) (<-chan *me
 	}
 
 	consumer.AddHandler(&nsqMessageHandler{
+		ctx:        ctx,
 		consumer:   consumer,
 		requeueTo:  requeueTo,
-		ctx:        ctx,
 		config:     &s.config,
 		closing:    s.closing,
 		outputChan: output,
@@ -133,10 +140,13 @@ func (s *NsqSubscriber) Subscribe(ctx context.Context, topic string) (<-chan *me
 	// start consuming
 	if len(s.config.NsqdAddrs) > 0 {
 		err = consumer.ConnectToNSQDs(s.config.NsqdAddrs)
-	} else if len(s.config.NsqdAddrs) > 0 {
-		err = consumer.ConnectToNSQLookupds(s.config.NsqdAddrs)
+		logFields["nsq_nsqds"] = s.config.NsqdAddrs
+	} else if len(s.config.LookupdAddrs) > 0 {
+		err = consumer.ConnectToNSQLookupds(s.config.LookupdAddrs)
+		logFields["nsq_lookupds"] = s.config.LookupdAddrs
 	}
 	if err != nil {
+		s.logger.Error("Cannot connect", err, logFields)
 		s.subscribersWg.Done()
 		close(output)
 		return nil, err
@@ -146,10 +156,14 @@ func (s *NsqSubscriber) Subscribe(ctx context.Context, topic string) (<-chan *me
 	go func(subscriber *nsq.Consumer, subscriberLogFields watermill.LogFields) {
 		select {
 		case <-ctx.Done():
+			s.logger.Trace("Context Done, before stoping consumer", logFields)
 		case <-s.closing:
+			s.logger.Trace("Closing, before stoping consumer", logFields)
 		}
 		consumer.Stop()
+		s.logger.Trace("Closing, after stop consumer", logFields)
 		<-consumer.StopChan
+		s.logger.Trace("Closing, stopped consumer", logFields)
 		close(output)
 		s.subscribersWg.Done()
 	}(consumer, logFields)
@@ -187,7 +201,7 @@ func (s *nsqMessageHandler) HandleMessage(m *nsq.Message) error {
 		"provider":       "nsq",
 		"consumer_group": s.channel,
 		"topic":          s.topic,
-		"nsq_message_id": m.ID,
+		"nsq_message_id": fmt.Sprintf("%s", m.ID),
 	}
 
 	s.processMessage(s.ctx, m, s.outputChan, logFields)
@@ -220,9 +234,11 @@ func (s *nsqMessageHandler) processMessage(
 	case output <- msg:
 		s.logger.Trace("Message sent to consumer", messageLogFields)
 	case <-s.closing:
+		m.RequeueWithoutBackoff(s.requeueTo)
 		s.logger.Trace("Closing, message discarded", messageLogFields)
 		return
 	case <-ctx.Done():
+		m.RequeueWithoutBackoff(s.requeueTo)
 		s.logger.Trace("Context cancelled, message discarded", messageLogFields)
 		return
 	}
@@ -233,19 +249,20 @@ func (s *nsqMessageHandler) processMessage(
 		s.logger.Trace("Message Acked", messageLogFields)
 	case <-msg.Nacked():
 		s.logger.Trace("Message Nacked", messageLogFields)
-		m.Requeue(s.requeueTo)
+		//m.Touch()
+		m.RequeueWithoutBackoff(s.requeueTo)
 		return
 	case <-time.After(s.config.AckWaitTimeout):
 		s.logger.Trace("Ack timeouted", messageLogFields)
-		m.Requeue(s.requeueTo)
+		m.RequeueWithoutBackoff(s.requeueTo)
 		return
 	case <-s.closing:
 		s.logger.Trace("Closing, message discarded before ack", messageLogFields)
-		m.Requeue(s.requeueTo)
+		m.RequeueWithoutBackoff(s.requeueTo)
 		return
 	case <-ctx.Done():
 		s.logger.Trace("Context cancelled, message discarded before ack", messageLogFields)
-		m.Requeue(s.requeueTo)
+		m.RequeueWithoutBackoff(s.requeueTo)
 		return
 	}
 }

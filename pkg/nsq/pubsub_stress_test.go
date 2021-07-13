@@ -1,6 +1,6 @@
 // +build stress
 
-package nats_test
+package nsq_test
 
 import (
 	"testing"

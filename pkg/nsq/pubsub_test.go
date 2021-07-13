@@ -27,6 +27,7 @@ func newPubSub(t *testing.T, clientID string, queueName string) (message.Publish
 	}
 
 	config := stdnsq.NewConfig()
+	config.MaxAttempts = 1000
 
 	pub, err := nsq.NewNsqPublisher(
 		nsq.NsqPublisherConfig{
@@ -37,11 +38,13 @@ func newPubSub(t *testing.T, clientID string, queueName string) (message.Publish
 
 	sub, err := nsq.NewNsqSubscriber(
 		nsq.NsqSubscriberConfig{
+			GroupName: queueName,
 			Config:       config,
+			NsqdAddrs: []string{nsqdURL,},
 			LookupdAddrs: []string{nsqLookupURL},
 		}, logger)
-	require.NoError(t, err)
 
+	require.NoError(t, err)
 	return pub, sub
 }
 
