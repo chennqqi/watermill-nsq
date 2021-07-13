@@ -1,0 +1,31 @@
+# for Watermill development purposes.
+# For Watermill based application docker please check https://watermill.io/docs/getting-started/
+
+version: '3'
+services:
+  nsqd:
+    image: nsqio/nsq:1.2.0
+      restart: unless-stopped
+    ports:
+      - 4150:4150
+      - 4151:4151
+    environment:
+      MYSQL_DATABASE: watermill
+      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+      
+  nsqlookupd:
+    image: nsqio/nsq:1.2.0
+    ports:
+      - 4160:4160
+      - 4161:4161
+    environment:
+      MYSQL_DATABASE: watermill
+      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+
+  nsqadmin:
+    image: nsqio/nsq:1.2.0
+    ports:
+      - 4171:4171
+    environment:
+      MYSQL_DATABASE: watermill
+      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
